@@ -633,7 +633,9 @@ impl ClientConfig {
         roots: Arc<rustls::RootCertStore>,
     ) -> Result<Self, rustls::client::VerifierBuilderError> {
         Ok(Self::new(Arc::new(crypto::rustls::QuicClientConfig::new(
-            WebPkiServerVerifier::builder_with_provider(roots, configured_provider()).build()?,
+            Arc::new(
+                WebPkiServerVerifier::builder(roots, configured_provider().as_ref()).build()?,
+            ),
         ))))
     }
 }

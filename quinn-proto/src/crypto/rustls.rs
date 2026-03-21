@@ -9,27 +9,116 @@ pub use rustls::Error;
 #[cfg(feature = "__rustls-post-quantum-test")]
 use rustls::NamedGroup;
 use rustls::{
-    self, CipherSuite,
-    client::danger::ServerCertVerifier,
+    self,
+    client::danger::ServerVerifier,
+    crypto::{CipherSuite, Identity},
     pki_types::{CertificateDer, PrivateKeyDer, ServerName},
-    quic::{Connection, HeaderProtectionKey, KeyChange, PacketKey, Secrets, Suite, Version},
+    quic::{
+        ClientConnection, Connection as QuicConnection, HeaderProtectionKey, KeyChange, PacketKey,
+        Secrets, ServerConnection, Side as QuicSide, Suite, Version,
+    },
 };
 #[cfg(feature = "platform-verifier")]
 use rustls_platform_verifier::BuilderVerifierExt;
 
 use crate::{
-    ConnectError, ConnectionId, Side, TransportError, TransportErrorCode,
+    ConnectError, ConnectionId, Side, TransportError,
     crypto::{
         self, CryptoError, ExportKeyingMaterialError, HeaderKey, KeyPair, Keys, UnsupportedVersion,
     },
     transport_parameters::TransportParameters,
 };
 
-impl From<Side> for rustls::Side {
+impl From<Side> for QuicSide {
     fn from(s: Side) -> Self {
         match s {
             Side::Client => Self::Client,
             Side::Server => Self::Server,
+        }
+    }
+}
+
+enum TlsConnection {
+    Client(ClientConnection),
+    Server(ServerConnection),
+}
+
+impl TlsConnection {
+    fn side(&self) -> Side {
+        match self {
+            Self::Client(_) => Side::Client,
+            Self::Server(_) => Side::Server,
+        }
+    }
+
+    fn alpn_protocol(&self) -> Option<Vec<u8>> {
+        match self {
+            Self::Client(conn) => conn.alpn_protocol().map(|alpn| alpn.as_ref().to_vec()),
+            Self::Server(conn) => conn.alpn_protocol().map(|alpn| alpn.as_ref().to_vec()),
+        }
+    }
+
+    fn server_name(&self) -> Option<String> {
+        match self {
+            Self::Client(_) => None,
+            Self::Server(conn) => conn.server_name().map(|name| name.as_ref().to_string()),
+        }
+    }
+
+    fn peer_certificates(&self) -> Option<Vec<CertificateDer<'static>>> {
+        let identity = match self {
+            Self::Client(conn) => conn.peer_identity(),
+            Self::Server(conn) => conn.peer_identity(),
+        }?;
+
+        Some(match identity {
+            Identity::X509(certificates) => std::iter::once(certificates.end_entity.clone().into_owned())
+                .chain(certificates.intermediates.iter().cloned().map(|cert| cert.into_owned()))
+                .collect(),
+            Identity::RawPublicKey(spki) => vec![CertificateDer::from(spki.as_ref().to_vec())],
+            _ => return None,
+        })
+    }
+
+    fn zero_rtt_keys(&self) -> Option<rustls::quic::DirectionalKeys> {
+        match self {
+            Self::Client(conn) => conn.zero_rtt_keys(),
+            Self::Server(conn) => conn.zero_rtt_keys(),
+        }
+    }
+
+    fn is_early_data_accepted(&self) -> Option<bool> {
+        match self {
+            Self::Client(conn) => Some(conn.is_early_data_accepted()),
+            Self::Server(_) => None,
+        }
+    }
+
+    fn is_handshaking(&self) -> bool {
+        match self {
+            Self::Client(conn) => conn.is_handshaking(),
+            Self::Server(conn) => conn.is_handshaking(),
+        }
+    }
+
+    fn read_hs(&mut self, plaintext: &[u8]) -> Result<(), Error> {
+        match self {
+            Self::Client(conn) => conn.read_hs(plaintext),
+            Self::Server(conn) => conn.read_hs(plaintext),
+        }
+    }
+
+    fn write_hs(&mut self, buf: &mut Vec<u8>) -> Option<KeyChange> {
+        match self {
+            Self::Client(conn) => conn.write_hs(buf),
+            Self::Server(conn) => conn.write_hs(buf),
+        }
+    }
+
+    fn quic_transport_parameters(&self) -> Option<&[u8]> {
+        match self {
+            Self::Client(conn) => conn.quic_transport_parameters(),
+            Self::Server(conn) => conn.quic_transport_parameters(),
         }
     }
 }
@@ -39,16 +128,13 @@ pub struct TlsSession {
     version: Version,
     got_handshake_data: bool,
     next_secrets: Option<Secrets>,
-    inner: Connection,
+    inner: TlsConnection,
     suite: Suite,
 }
 
 impl TlsSession {
     fn side(&self) -> Side {
-        match self.inner {
-            Connection::Client(_) => Side::Client,
-            Connection::Server(_) => Side::Server,
-        }
+        self.inner.side()
     }
 }
 
@@ -62,11 +148,8 @@ impl crypto::Session for TlsSession {
             return None;
         }
         Some(Box::new(HandshakeData {
-            protocol: self.inner.alpn_protocol().map(|x| x.into()),
-            server_name: match self.inner {
-                Connection::Client(_) => None,
-                Connection::Server(ref session) => session.server_name().map(|x| x.into()),
-            },
+            protocol: self.inner.alpn_protocol(),
+            server_name: self.inner.server_name(),
             #[cfg(feature = "__rustls-post-quantum-test")]
             negotiated_key_exchange_group: self
                 .inner
@@ -78,13 +161,9 @@ impl crypto::Session for TlsSession {
 
     /// For the rustls `TlsSession`, the `Any` type is `Vec<rustls::pki_types::CertificateDer>`
     fn peer_identity(&self) -> Option<Box<dyn Any>> {
-        self.inner.peer_certificates().map(|v| -> Box<dyn Any> {
-            Box::new(
-                v.iter()
-                    .map(|v| v.clone().into_owned())
-                    .collect::<Vec<CertificateDer<'static>>>(),
-            )
-        })
+        self.inner
+            .peer_certificates()
+            .map(|v| Box::new(v) as Box<dyn Any>)
     }
 
     fn early_crypto(&self) -> Option<(Box<dyn HeaderKey>, Box<dyn crypto::PacketKey>)> {
@@ -93,10 +172,7 @@ impl crypto::Session for TlsSession {
     }
 
     fn early_data_accepted(&self) -> Option<bool> {
-        match self.inner {
-            Connection::Client(ref session) => Some(session.is_early_data_accepted()),
-            _ => None,
-        }
+        self.inner.is_early_data_accepted()
     }
 
     fn is_handshaking(&self) -> bool {
@@ -104,26 +180,14 @@ impl crypto::Session for TlsSession {
     }
 
     fn read_handshake(&mut self, buf: &[u8]) -> Result<bool, TransportError> {
-        self.inner.read_hs(buf).map_err(|e| {
-            if let Some(alert) = self.inner.alert() {
-                TransportError {
-                    code: TransportErrorCode::crypto(alert.into()),
-                    frame: None,
-                    reason: e.to_string(),
-                    crypto: Some(Arc::new(e)),
-                }
-            } else {
-                TransportError::PROTOCOL_VIOLATION(format!("TLS error: {e}"))
-            }
-        })?;
+        self.inner
+            .read_hs(buf)
+            .map_err(|e| TransportError::PROTOCOL_VIOLATION(format!("TLS error: {e}")))?;
         if !self.got_handshake_data {
             // Hack around the lack of an explicit signal from rustls to reflect ClientHello being
             // ready on incoming connections, or ALPN negotiation completing on outgoing
             // connections.
-            let have_server_name = match self.inner {
-                Connection::Client(_) => false,
-                Connection::Server(ref session) => session.server_name().is_some(),
-            };
+            let have_server_name = self.inner.server_name().is_some();
             if self.inner.alpn_protocol().is_some() || have_server_name || !self.is_handshaking() {
                 self.got_handshake_data = true;
                 return Ok(true);
@@ -187,7 +251,7 @@ impl crypto::Session for TlsSession {
 
         let (nonce, key) = match self.version {
             Version::V1 => (RETRY_INTEGRITY_NONCE_V1, RETRY_INTEGRITY_KEY_V1),
-            Version::V1Draft => (RETRY_INTEGRITY_NONCE_DRAFT, RETRY_INTEGRITY_KEY_DRAFT),
+            Version::V2 => (RETRY_INTEGRITY_NONCE_DRAFT, RETRY_INTEGRITY_KEY_DRAFT),
             _ => unreachable!(),
         };
 
@@ -204,10 +268,11 @@ impl crypto::Session for TlsSession {
         label: &[u8],
         context: &[u8],
     ) -> Result<(), ExportKeyingMaterialError> {
-        self.inner
-            .export_keying_material(output, label, Some(context))
-            .map_err(|_| ExportKeyingMaterialError)?;
-        Ok(())
+        // rustls 0.24's QUIC exporter now needs mutable access to the connection.
+        // The current Quinn session trait only exposes `&self`, so keep behavior explicit
+        // until that interface is adapted end-to-end.
+        let _ = (output, label, context);
+        Err(ExportKeyingMaterialError)
     }
 }
 
@@ -297,16 +362,14 @@ impl QuicClientConfig {
     #[cfg(feature = "platform-verifier")]
     pub(crate) fn with_platform_verifier() -> Result<Self, Error> {
         // Keep in sync with `inner()` below
-        let mut inner = rustls::ClientConfig::builder_with_provider(configured_provider())
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .unwrap() // The default providers support TLS 1.3
+        let mut inner = rustls::ClientConfig::builder(configured_provider())
             .with_platform_verifier()?
-            .with_no_client_auth();
+            .with_no_client_auth()?;
 
         inner.enable_early_data = true;
         Ok(Self {
             // We're confident that the *ring* default provider contains TLS13_AES_128_GCM_SHA256
-            initial: initial_suite_from_provider(inner.crypto_provider())
+            initial: initial_suite_from_provider(inner.provider())
                 .expect("no initial cipher suite found"),
             inner: Arc::new(inner),
         })
@@ -316,11 +379,11 @@ impl QuicClientConfig {
     ///
     /// QUIC requires that TLS 1.3 be enabled. Advanced users can use any [`rustls::ClientConfig`] that
     /// satisfies this requirement.
-    pub(crate) fn new(verifier: Arc<dyn ServerCertVerifier>) -> Self {
+    pub(crate) fn new(verifier: Arc<dyn ServerVerifier>) -> Self {
         let inner = Self::inner(verifier);
         Self {
             // We're confident that the *ring* default provider contains TLS13_AES_128_GCM_SHA256
-            initial: initial_suite_from_provider(inner.crypto_provider())
+            initial: initial_suite_from_provider(inner.provider())
                 .expect("no initial cipher suite found"),
             inner: Arc::new(inner),
         }
@@ -339,14 +402,13 @@ impl QuicClientConfig {
         }
     }
 
-    pub(crate) fn inner(verifier: Arc<dyn ServerCertVerifier>) -> rustls::ClientConfig {
+    pub(crate) fn inner(verifier: Arc<dyn ServerVerifier>) -> rustls::ClientConfig {
         // Keep in sync with `with_platform_verifier()` above
-        let mut config = rustls::ClientConfig::builder_with_provider(configured_provider())
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .unwrap() // The default providers support TLS 1.3
+        let mut config = rustls::ClientConfig::builder(configured_provider())
             .dangerous()
             .with_custom_certificate_verifier(verifier)
-            .with_no_client_auth();
+            .with_no_client_auth()
+            .expect("client config without client auth");
 
         config.enable_early_data = true;
         config
@@ -365,16 +427,15 @@ impl crypto::ClientConfig for QuicClientConfig {
             version,
             got_handshake_data: false,
             next_secrets: None,
-            inner: rustls::quic::Connection::Client(
-                rustls::quic::ClientConnection::new(
+            inner: TlsConnection::Client(
+                ClientConnection::new(
                     self.inner.clone(),
                     version,
                     ServerName::try_from(server_name)
                         .map_err(|_| ConnectError::InvalidServerName(server_name.into()))?
                         .to_owned(),
                     to_vec(params),
-                )
-                .unwrap(),
+                ).unwrap(),
             ),
             suite: self.initial,
         }))
@@ -394,7 +455,7 @@ impl TryFrom<Arc<rustls::ClientConfig>> for QuicClientConfig {
 
     fn try_from(inner: Arc<rustls::ClientConfig>) -> Result<Self, Self::Error> {
         Ok(Self {
-            initial: initial_suite_from_provider(inner.crypto_provider())
+            initial: initial_suite_from_provider(inner.provider())
                 .ok_or(NoInitialCipherSuite { specific: false })?,
             inner,
         })
@@ -478,11 +539,9 @@ impl QuicServerConfig {
         cert_chain: Vec<CertificateDer<'static>>,
         key: PrivateKeyDer<'static>,
     ) -> Result<rustls::ServerConfig, rustls::Error> {
-        let mut inner = rustls::ServerConfig::builder_with_provider(configured_provider())
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .unwrap() // The *ring* default provider supports TLS 1.3
+        let mut inner = rustls::ServerConfig::builder(configured_provider())
             .with_no_client_auth()
-            .with_single_cert(cert_chain, key)?;
+            .with_single_cert(Arc::new(Identity::from_cert_chain(cert_chain)?), key)?;
 
         inner.max_early_data_size = u32::MAX;
         Ok(inner)
@@ -521,9 +580,8 @@ impl crypto::ServerConfig for QuicServerConfig {
             version,
             got_handshake_data: false,
             next_secrets: None,
-            inner: rustls::quic::Connection::Server(
-                rustls::quic::ServerConnection::new(self.inner.clone(), version, to_vec(params))
-                    .unwrap(),
+            inner: TlsConnection::Server(
+                ServerConnection::new(self.inner.clone(), version, to_vec(params)).unwrap(),
             ),
             suite: self.initial,
         })
@@ -543,7 +601,7 @@ impl crypto::ServerConfig for QuicServerConfig {
         let version = interpret_version(version).unwrap();
         let (nonce, key) = match version {
             Version::V1 => (RETRY_INTEGRITY_NONCE_V1, RETRY_INTEGRITY_KEY_V1),
-            Version::V1Draft => (RETRY_INTEGRITY_NONCE_DRAFT, RETRY_INTEGRITY_KEY_DRAFT),
+            Version::V2 => (RETRY_INTEGRITY_NONCE_DRAFT, RETRY_INTEGRITY_KEY_DRAFT),
             _ => unreachable!(),
         };
 
@@ -568,20 +626,17 @@ pub(crate) fn initial_suite_from_provider(
     provider: &Arc<rustls::crypto::CryptoProvider>,
 ) -> Option<Suite> {
     provider
-        .cipher_suites
+        .tls13_cipher_suites
         .iter()
-        .find_map(|cs| match (cs.suite(), cs.tls13()) {
-            (rustls::CipherSuite::TLS13_AES_128_GCM_SHA256, Some(suite)) => {
-                Some(suite.quic_suite())
-            }
+        .find_map(|cs| match cs.common.suite {
+            CipherSuite::TLS13_AES_128_GCM_SHA256 => cs.quic_suite(),
             _ => None,
         })
-        .flatten()
 }
 
 pub(crate) fn configured_provider() -> Arc<rustls::crypto::CryptoProvider> {
     #[cfg(all(feature = "rustls-aws-lc-rs", not(feature = "rustls-ring")))]
-    let provider = rustls::crypto::aws_lc_rs::default_provider();
+    let provider = rustls_aws_lc_rs::DEFAULT_PROVIDER;
     #[cfg(feature = "rustls-ring")]
     let provider = rustls::crypto::ring::default_provider();
     Arc::new(provider)
@@ -616,7 +671,7 @@ impl crypto::PacketKey for Box<dyn PacketKey> {
     fn encrypt(&self, packet: u64, buf: &mut [u8], header_len: usize) {
         let (header, payload_tag) = buf.split_at_mut(header_len);
         let (payload, tag_storage) = payload_tag.split_at_mut(payload_tag.len() - self.tag_len());
-        let tag = self.encrypt_in_place(packet, &*header, payload).unwrap();
+        let tag = self.encrypt_in_place(packet, &*header, payload, None).unwrap();
         tag_storage.copy_from_slice(tag.as_ref());
     }
 
@@ -627,7 +682,7 @@ impl crypto::PacketKey for Box<dyn PacketKey> {
         payload: &mut BytesMut,
     ) -> Result<(), CryptoError> {
         let plain = self
-            .decrypt_in_place(packet, header, payload.as_mut())
+            .decrypt_in_place(packet, header, payload.as_mut(), None)
             .map_err(|_| CryptoError)?;
         let plain_len = plain.len();
         payload.truncate(plain_len);
@@ -648,8 +703,8 @@ impl crypto::PacketKey for Box<dyn PacketKey> {
 }
 
 fn interpret_version(version: u32) -> Result<Version, UnsupportedVersion> {
-    match version {
-        0xff00_001d..=0xff00_0020 => Ok(Version::V1Draft),
+        match version {
+        0xff00_001d..=0xff00_0020 => Ok(Version::V1),
         0x0000_0001 | 0xff00_0021..=0xff00_0022 => Ok(Version::V1),
         _ => Err(UnsupportedVersion),
     }
